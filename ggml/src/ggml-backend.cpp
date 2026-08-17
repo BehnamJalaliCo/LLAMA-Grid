@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <vector>
 #include <set>
@@ -1839,13 +1840,42 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
                 if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
                     // create a copy of the input in the split's backend
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
-                        if (node->op == GGML_OP_REDUCE) {
-                            //printf("setting tensor_id_copy(reduce, %zu, %d, %s) to %s\n", src_id, cur_backend_id, node->name, src->name);
-                            tensor_id_copy(src_id, cur_backend_id, 0) = src;
-                        } else if (node->op == GGML_OP_FAKE_CPY && src->op == GGML_OP_REDUCE) {
-                            //printf("setting tensor_id_copy(fake_cpy, %zu, %d, %s) to %s\n", src_id, cur_backend_id, node->name, src->src[j]->name);
-                            tensor_id_copy(src_id, cur_backend_id, 0) = src->src[j];
-                        } else {
+                        if (node->op == GGML_OP_FAKE_CPY && src->op == GGML_OP_REDUCE) {
+                            fprintf(stderr,
+                                "FAKECPY-REDUCE: fake_j=%d node=%s reduce=%s "
+                                "reduce_backend=%d dst_backend=%d n=%d\\n",
+                                j,
+                                node->name,
+                                src->name,
+                                src_backend_id,
+                                cur_backend_id,
+                                src->op_params[1]);
+
+                            const int reduce_n = src->op_params[1];
+                            int reduce_src_id = -1;
+
+                            for (int k = 0; k < reduce_n; ++k) {
+                                struct ggml_tensor * rsrc = src->src[k];
+
+                                fprintf(stderr,
+                                    "  REDUCE-SRC: k=%d ptr=%p name=%s buf=%p backend=%d\\n",
+                                    k,
+                                    (void *) rsrc,
+                                    rsrc ? rsrc->name : "NULL",
+                                    rsrc ? (void *) rsrc->buffer : nullptr,
+                                    rsrc ? sched->hv_tensor_backend_ids[hash_id(rsrc)] : -1);
+
+                                if (rsrc && tensor_backend_id(rsrc) == cur_backend_id) {
+                                    reduce_src_id = k;
+                                }
+                            }
+
+                            if (reduce_src_id >= 0) {
+                                tensor_id_copy(src_id, cur_backend_id, 0) = src->src[reduce_src_id];
+                            }
+                        }
+
+                        if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
                         for (int c = 0; c < sched->n_copies; c++) {
                             struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
@@ -2727,13 +2757,42 @@ static void ggml_sched_prepare_graph(ggml_backend_sched_t sched) {
                 for (int j = 0; j < split->n_inputs; ++j) {
                     if (ggml_backend_buffer_is_host(split->inputs[j]->buffer)) continue;
                     auto input_cpy = tensor_copy(split->inputs[j], backend_id, sched->cur_copy);
-                    for (int k = 0; k < split->graph.n_nodes; ++k) {
-                        auto node = split->graph.nodes[k];
-                        for (int l = 0; l < GGML_MAX_SRC; ++l) {
-                            if (node->src[l] && node->src[l]->data == input_cpy->data) node->src[l]->data = ptr;
+                    auto input_buf = sched->input_memory_bufs[backend_id];
+                    GGML_ASSERT(input_buf != nullptr);
+                    void * old_data = input_cpy->data;
+                    const uintptr_t old_start = (uintptr_t) old_data;
+                    const uintptr_t old_end = old_start + ggml_nbytes(input_cpy);
+                    std::set<ggml_tensor *> rebound;
+                    std::function<void(ggml_tensor *)> rebind = [&](ggml_tensor * tensor) {
+                        if (tensor == nullptr || !rebound.insert(tensor).second) {
+                            return;
                         }
+
+                        const uintptr_t data = (uintptr_t) tensor->data;
+                        const size_t size = ggml_nbytes(tensor);
+                        if (tensor->data != nullptr && data >= old_start &&
+                                data + size >= data && data + size <= old_end) {
+                            tensor->buffer = input_buf;
+                            tensor->data = (char *) ptr + (data - old_start);
+                            ggml_backend_buffer_init_tensor(input_buf, tensor);
+                        }
+
+                        rebind(tensor->view_src);
+                        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+                            rebind(tensor->src[i]);
+                        }
+                    };
+
+                    rebind(input_cpy);
+                    for (int k = 0; k < split->graph.n_nodes; ++k) {
+                        rebind(split->graph.nodes[k]);
                     }
+                    // The copy is relocated into input_memory_bufs. Keep its
+                    // buffer ownership in sync with the new data address so
+                    // RPC serialization uses the matching remote buffer.
+                    input_cpy->buffer = input_buf;
                     input_cpy->data = ptr;
+                    ggml_backend_buffer_init_tensor(input_buf, input_cpy);
                     ptr += tensor_size(split->inputs[j]);
                 }
                 input_size += this_size;

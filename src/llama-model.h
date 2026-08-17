@@ -467,6 +467,12 @@ struct llama_model {
     llama_hparams hparams = {};
     llama_vocab   vocab;
 
+    // Authoritative GGUF model accounting.  Graph split mode also creates
+    // per-device shard tensors; counting those tensors would report the
+    // physical model twice.
+    uint64_t n_params = 0;
+    size_t   model_size = 0;
+
     struct ggml_tensor * tok_embd;
     struct ggml_tensor * type_embd;
     struct ggml_tensor * pos_embd;

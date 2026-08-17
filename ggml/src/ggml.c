@@ -13412,6 +13412,51 @@ static void ggml_compute_forward_add_q_f32(
     }
 }
 
+
+static void ggml_compute_forward_reduce(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    GGML_ASSERT(dst->op == GGML_OP_REDUCE);
+    GGML_ASSERT(dst->op_params[0] == GGML_OP_ADD);
+
+    const int n = dst->op_params[1];
+    GGML_ASSERT(n > 1 && n <= GGML_MAX_SRC);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int64_t ne = ggml_nelements(dst);
+    const int64_t dr = (ne + nth - 1)/nth;
+    const int64_t i0 = dr*ith;
+    const int64_t i1 = MIN(i0 + dr, ne);
+
+    float * d = (float *) dst->data;
+
+    for (int64_t i = i0; i < i1; ++i) {
+        float sum = 0.0f;
+
+        for (int j = 0; j < n; ++j) {
+            const struct ggml_tensor * src = dst->src[j];
+
+            if (src == NULL) {
+                continue;
+            }
+
+            GGML_ASSERT(src->type == GGML_TYPE_F32);
+            GGML_ASSERT(ggml_are_same_shape(src, dst));
+            GGML_ASSERT(ggml_is_contiguous(src));
+
+            const float * s = (const float *) src->data;
+            sum += s[i];
+        }
+
+        d[i] = sum;
+    }
+}
+
 static void ggml_compute_forward_add(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst) {
@@ -26384,8 +26429,8 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
     switch (tensor->op) {
         case GGML_OP_REDUCE:
             {
-                GGML_ABORT("REDUCE not implemented");
-            }
+                ggml_compute_forward_reduce(params, tensor);
+            } break;
         case GGML_OP_FAKE_CPY:
             {
                 GGML_ABORT("FAKE_CPY not implemented");
@@ -28530,6 +28575,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CPY:
         case GGML_OP_DUP:
         case GGML_OP_CONT:
+        case GGML_OP_REDUCE:
         case GGML_OP_ADD:
         case GGML_OP_ADD_ID:
         case GGML_OP_ADD1:

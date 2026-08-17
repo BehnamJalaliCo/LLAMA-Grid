@@ -1,3 +1,4 @@
+#include <unordered_set>
 //
 // Copyright (C) 2023-2025 The llama.cpp authors
 // Copyright (C) 2024-2025 Iwan Kawrakow
@@ -485,14 +486,25 @@ static ggml_backend_buffer_type_t llama_default_buffer_type_offload(const llama_
 static ggml_backend_buffer_type_t llama_default_buffer_type_split(const llama_model & model, int fallback_gpu) {
     ggml_backend_buffer_type_t buft = nullptr;
 
+#ifdef GGML_USE_RPC
+    if (!model.rpc_servers.empty() && model.devices.size() > 1) {
+        std::vector<ggml_backend_buffer_type_t> split_bufts;
+        split_bufts.reserve(model.devices.size());
+        for (int32_t device : model.devices) {
+            split_bufts.push_back(llama_default_buffer_type_offload(model, device));
+        }
+        buft = ggml_backend_rpc_split_buffer_type(split_bufts.data(), split_bufts.size());
+    }
+#endif
+
 #ifdef GGML_USE_CUDA
-    if (ggml_backend_cuda_get_device_count() > 1) {
+    if (buft == nullptr && ggml_backend_cuda_get_device_count() > 1) {
         buft = ggml_backend_cuda_split_buffer_type(model.splits.data());
     }
 #endif
 
 #ifdef GGML_USE_SYCL
-    if (ggml_backend_sycl_get_device_count() > 1) {
+    if (buft == nullptr && ggml_backend_sycl_get_device_count() > 1) {
         buft = ggml_backend_sycl_split_buffer_type(model.splits.data());
     }
 #endif
@@ -864,8 +876,21 @@ llama_context::~llama_context() {
     free_dsv4_cache_tensors();
     ggml_backend_sched_free(sched);
 
+    LLAMA_LOG_ERROR("DEBUG: context destructor has %zu backends\\n", backends.size());
+    for (size_t i = 0; i < backends.size(); ++i) {
+        LLAMA_LOG_ERROR("DEBUG: backend[%zu] ptr=%p name=%s\\n",
+            i,
+            (void *) backends[i],
+            backends[i] ? ggml_backend_name(backends[i]) : "NULL");
+    }
+
+    // A backend pointer can appear more than once after device/RPC
+    // selection and reordering. Free every backend object exactly once.
+    std::unordered_set<ggml_backend_t> freed_backends;
     for (ggml_backend_t backend : backends) {
-        ggml_backend_free(backend);
+        if (backend != nullptr && freed_backends.insert(backend).second) {
+            ggml_backend_free(backend);
+        }
     }
 
     ggml_backend_buffer_free(buf_output);
@@ -3883,11 +3908,18 @@ static bool item_in_list(const std::vector<std::string>& devices, const char* na
 
 static void ggml_backend_add_from_device(llama_context* ctx, ggml_backend_t backend) {
     const char* name = ggml_backend_name(backend);
-    if (ctx->cparams.devices.size()) {
-        if (item_in_list(ctx->cparams.devices, name)) {
-            ctx->backends.push_back(backend);
-        }
-    } else {
+
+    const bool selected =
+        ctx->cparams.devices.empty() ||
+        item_in_list(ctx->cparams.devices, name);
+
+    if (!selected) {
+        return;
+    }
+
+    // A backend must have exactly one owner in llama_context::backends.
+    if (std::find(ctx->backends.begin(), ctx->backends.end(), backend) ==
+            ctx->backends.end()) {
         ctx->backends.push_back(backend);
     }
 }
@@ -3912,7 +3944,7 @@ static bool is_model_split_supported(const llama_model & model) {
         LLM_ARCH_SEED_OSS,
         LLM_ARCH_STEP35,
         LLM_ARCH_LAGUNA,
-        //LLM_ARCH_QWEN3NEXT,
+        LLM_ARCH_QWEN3NEXT,
         LLM_ARCH_QWEN35,
         LLM_ARCH_QWEN35MOE,
         LLM_ARCH_GEMMA4,
@@ -4968,6 +5000,9 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
                 params.repack_tensors, params.use_thp, params.merge_qkv, params.merge_up_gate_exps,
                 params.defer_experts,
                 params.kv_overrides, params.tensor_buft_overrides);
+
+        model.n_params   = ml.n_elements;
+        model.model_size = ml.n_bytes;
 
         model.hparams.vocab_only = params.vocab_only;
 
@@ -7822,7 +7857,14 @@ struct llama_model * llama_model_load_from_file(
 
     for (auto & device : device_names) {
         if (buffer_names.count(device)) {
-            model->devices.push_back(buffer_names[device]);
+            const int32_t device_id = buffer_names[device];
+            // The RPC backends are explicitly prepended above, but they are
+            // also returned by llama_get_device_count() and therefore appear
+            // in gpu_names.  Keep one entry per backend: model.devices is the
+            // device set used to size and place split tensors.
+            if (std::find(model->devices.begin(), model->devices.end(), device_id) == model->devices.end()) {
+                model->devices.push_back(device_id);
+            }
         } else {
             LLAMA_LOG_ERROR("%s backend not available.\n", device.c_str());
         }
@@ -8965,11 +9007,7 @@ int32_t llama_model_desc(const struct llama_model * model, char * buf, size_t bu
 }
 
 uint64_t llama_model_size(const struct llama_model * model) {
-    uint64_t size = 0;
-    for (const auto & it : model->tensors_by_name) {
-        size += ggml_nbytes(it.second);
-    }
-    return size;
+    return model->model_size;
 }
 
 const char* llama_model_chat_template(const struct llama_model* model, const char* name) {
@@ -8991,11 +9029,7 @@ const char* llama_model_chat_template(const struct llama_model* model, const cha
 }
 
 uint64_t llama_model_n_params(const struct llama_model * model) {
-    uint64_t nparams = 0;
-    for (const auto & it : model->tensors_by_name) {
-        nparams += ggml_nelements(it.second);
-    }
-    return nparams;
+    return model->n_params;
 }
 
 struct ggml_tensor * llama_get_model_tensor(struct llama_model * model, const char * name) {
