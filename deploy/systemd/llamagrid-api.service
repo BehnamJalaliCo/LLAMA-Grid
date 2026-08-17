@@ -1,0 +1,24 @@
+[Unit]
+Description=LlamaGrid OpenAI-compatible API dispatcher
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=llamagrid
+Group=llamagrid
+WorkingDirectory=/opt/ik_llama.cpp
+EnvironmentFile=/etc/llamagrid/api.env
+ExecStart=/usr/bin/python3 /opt/ik_llama.cpp/tools/qwen_replica_dispatcher.py
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGINT
+TimeoutStopSec=30s
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

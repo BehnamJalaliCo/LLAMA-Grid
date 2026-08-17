@@ -107,6 +107,11 @@ lcov-report/
 
 /.venv
 __pycache__/
+control_plane/.venv/
+control_plane/frontend/node_modules/
+control_plane/frontend/.next/
+control_plane/.env
+*.tsbuildinfo
 */poetry.lock
 poetry.toml
 poetry.lock

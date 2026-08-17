@@ -1,4 +1,4 @@
-# LlamaGrid — Production Qwen3-Coder-Next Inference Grid
+# LlamaGrid — Production OpenAI-Compatible Inference Grid
 
 [![API](https://img.shields.io/badge/API-OpenAI--compatible-10b981.svg)](https://api.beyra-ai.com/v1)
 [![Workers](https://img.shields.io/badge/replicas-14-6366f1.svg)](https://github.com/BehnamJalaliCo/LLAMA-Grid)
@@ -13,7 +13,7 @@
 
 ### English
 
-LlamaGrid is the production architecture built around this repository for serving **Qwen3-Coder-Next 80B Q4_K_M**. Each worker owns a complete model replica. The dispatcher assigns each request to one healthy replica and never splits one request across workers. This makes the system predictable, observable, and horizontally scalable for concurrent requests.
+LlamaGrid is a production architecture built around this repository for serving any compatible llama-server model. The current deployment uses **Qwen3-Coder-Next 80B Q4_K_M** as one configured profile, but the dispatcher and control plane do not require that model. Each worker owns a complete model replica. The dispatcher assigns each request to one healthy replica and never splits one request across workers. This makes the system predictable, observable, and horizontally scalable for concurrent requests.
 
 The public contract is OpenAI-compatible. Clients use `https://api.beyra-ai.com/v1`, authenticate with a Bearer key, and call `/v1/models`, `/v1/chat/completions`, or `/v1/completions`. Caddy terminates TLS on Model-Hub; the dispatcher is localhost-only; workers remain private.
 
@@ -38,6 +38,45 @@ LlamaGrid معماری production این repository برای سرویس‌دهی
 | Auth | `Authorization: Bearer <API_KEY>` | احراز هویت Bearer |
 | Streaming | SSE, no full-response buffering | streaming فوری |
 | Services | `llamagrid-api.service` + `caddy.service` | سرویس‌های دائمی |
+
+## Operator control plane · پنل مدیریت
+
+The repository now includes a separate production control plane under
+[`control_plane/`](control_plane/). It is an operations layer around the
+existing inference data plane: it does not replace the dispatcher and does
+not change worker performance tuning.
+
+| Layer | Production choice | Scope |
+|---|---|---|
+| API | FastAPI + Uvicorn | Auth, inventory, model catalog, deployments, jobs, SSE chat, metrics |
+| Database | PostgreSQL with a TimescaleDB-compatible image | Durable state; future high-volume metrics hypertables |
+| Jobs | Celery + Redis | Observable provisioning and rolling deployment state machines |
+| UI | Next.js 16 + TypeScript | Dashboard, chat playground, model/server/deployment/key screens |
+| Security | Argon2 passwords, encrypted provider tokens, hashed API keys | Secrets stay server-side and are never logged |
+| Runtime | Docker Compose + systemd + Caddy | Reproducible service lifecycle and HTTPS routing |
+
+The panel is served at `https://beyra-ai.com`; the existing inference API
+remains at `https://api.beyra-ai.com/v1`. Panel-generated keys can also call
+the OpenAI-compatible gateway at `https://beyra-ai.com/v1` without exposing
+the dispatcher’s internal key to a browser.
+
+این repository یک Control Plane production در مسیر
+[`control_plane/`](control_plane/) دارد. این پنل لایه‌ی عملیاتی اطراف data plane
+فعلی است؛ dispatcher و tuning مربوط به Workerها را جایگزین یا تغییر نمی‌دهد.
+
+| لایه | انتخاب production | محدوده |
+|---|---|---|
+| API | FastAPI + Uvicorn | احراز هویت، inventory، catalog مدل، deployment، job، chat و metrics |
+| دیتابیس | PostgreSQL با image سازگار با TimescaleDB | state پایدار و آماده‌ی metrics حجیم |
+| صف کار | Celery + Redis | اجرای قابل‌مشاهده‌ی provisioning و rolling deployment |
+| پنل | Next.js + TypeScript | داشبورد، chat، مدل، سرور، deployment و API key |
+| امنیت | Argon2، رمزنگاری tokenها و hash کردن API key | secretها فقط در backend می‌مانند |
+| اجرا | Docker Compose + systemd + Caddy | lifecycle تکرارپذیر و HTTPS |
+
+پنل روی `https://beyra-ai.com` و API inference فعلی روی
+`https://api.beyra-ai.com/v1` باقی می‌ماند. API keyهای ساخته‌شده در پنل، gateway
+سازگار با OpenAI در `https://beyra-ai.com/v1` را بدون افشای key داخلی dispatcher
+قابل استفاده می‌کنند.
 
 ## Live architecture · معماری زنده
 
@@ -378,17 +417,17 @@ Prefill scales with concurrent requests because replicas work independently. Dec
 ### Adding a worker · افزودن Worker
 
 1. Provision the node on the private network with the same runtime dependencies.
-2. Copy the exact compatible binary and all GGUF shards.
-3. Start `llama-server` on the private IP only.
-4. Add one `--backend PRIVATE_IP:8080` line to the service unit.
+2. Copy the exact compatible binary and all model files.
+3. Start `llama-server` on the private interface only.
+4. Add the endpoint to the comma-separated `LLAMAGRID_BACKENDS` value in `/etc/llamagrid/api.env`; do not edit the unit or source.
 5. Run `systemctl daemon-reload && systemctl restart llamagrid-api`.
 6. Confirm `/ready` and a concurrent public request test.
 7. Record binary hashes, model hashes, topology, memory, and throughput.
 
 ۱. Node را روی شبکه‌ی خصوصی آماده کنید.
-۲. binary سازگار و همه‌ی shardها را کپی کنید.
-۳. `llama-server` را فقط روی private IP اجرا کنید.
-۴. یک خط `--backend PRIVATE_IP:8080` به unit اضافه کنید.
+۲. binary سازگار و فایل‌های مدل را کپی کنید.
+۳. `llama-server` را فقط روی interface خصوصی اجرا کنید.
+۴. endpoint را به مقدار comma-separated `LLAMAGRID_BACKENDS` در `/etc/llamagrid/api.env` اضافه کنید؛ unit یا source را تغییر ندهید.
 ۵. `systemctl daemon-reload && systemctl restart llamagrid-api` را اجرا کنید.
 ۶. `/ready` و تست concurrent عمومی را تأیید کنید.
 ۷. hashها، topology، حافظه و throughput را ثبت کنید.
@@ -396,7 +435,7 @@ Prefill scales with concurrent requests because replicas work independently. Dec
 ### API changes · تغییرات API
 
 - Preserve `/health`, `/ready`, and `/metrics` semantics.
-- Keep `qwen3-coder-next` stable unless a versioned API contract is introduced.
+- Keep the configured public model ID stable unless a versioned API contract is introduced.
 - Never forward Authorization to workers.
 - Never add full-response buffering to the SSE path.
 - Test authentication, malformed input, JSON, SSE, failover, and concurrency.

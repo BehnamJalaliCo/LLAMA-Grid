@@ -1,0 +1,18 @@
+[Unit]
+Description=Private Docker bridge to the loopback LlamaGrid dispatcher
+Requires=docker.service llamagrid-control-plane.service
+After=docker.service llamagrid-control-plane.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/llamagrid/api.env
+ExecStart=/bin/sh -c 'exec /usr/bin/socat TCP-LISTEN:"$LLAMAGRID_BRIDGE_PORT",bind="$LLAMAGRID_BRIDGE_BIND_HOST",reuseaddr,fork TCP:"$LLAMAGRID_DISPATCHER_TARGET"'
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target

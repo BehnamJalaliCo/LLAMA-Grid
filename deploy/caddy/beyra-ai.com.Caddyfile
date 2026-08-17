@@ -1,0 +1,27 @@
+beyra-ai.com {
+    @control_plane path /api/* /v1/* /health /ready /metrics
+
+    handle @control_plane {
+        reverse_proxy 127.0.0.1:8000 {
+            flush_interval -1
+            transport http {
+                dial_timeout 5s
+                response_header_timeout 900s
+                read_timeout 900s
+                write_timeout 30s
+            }
+        }
+    }
+
+    handle {
+        reverse_proxy 127.0.0.1:3000 {
+            flush_interval -1
+            transport http {
+                dial_timeout 5s
+                response_header_timeout 900s
+                read_timeout 900s
+                write_timeout 30s
+            }
+        }
+    }
+}
