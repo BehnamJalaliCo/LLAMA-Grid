@@ -13,7 +13,6 @@ import json
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Iterable
 
 
 DEFAULT_BACKENDS = ("10.50.0.21:8080", "10.50.0.22:8080")
@@ -24,14 +23,30 @@ class DispatcherState:
     def __init__(self, backends: tuple[str, ...], timeout: float) -> None:
         self.backends = backends
         self.timeout = timeout
-        self.lock = threading.Lock()
+        self.condition = threading.Condition()
+        self.inflight = {backend: 0 for backend in backends}
         self.next_backend = 0
 
-    def select(self) -> str:
-        with self.lock:
-            backend = self.backends[self.next_backend % len(self.backends)]
+    def acquire(self) -> str:
+        # Keep at most one request in flight per np=1 replica when the client
+        # maintains one request per worker.  This avoids making a fast worker
+        # wait behind a slower replica selected by round-robin scheduling.
+        with self.condition:
+            least = min(self.inflight.values())
+            candidates = [backend for backend in self.backends if self.inflight[backend] == least]
+            backend = candidates[self.next_backend % len(candidates)]
             self.next_backend += 1
+            self.inflight[backend] += 1
             return backend
+
+    def release(self, backend: str) -> None:
+        with self.condition:
+            self.inflight[backend] -= 1
+            self.condition.notify_all()
+
+    def snapshot(self) -> dict[str, int]:
+        with self.condition:
+            return dict(self.inflight)
 
 
 def split_backend(backend: str) -> tuple[str, int]:
@@ -56,7 +71,8 @@ class DispatcherHandler(BaseHTTPRequestHandler):
                 {
                     "status": "ok",
                     "backends": list(self.state.backends),
-                    "mode": "request_round_robin",
+                    "mode": "least_inflight",
+                    "inflight": self.state.snapshot(),
                 },
             )
             return
@@ -88,9 +104,10 @@ class DispatcherHandler(BaseHTTPRequestHandler):
             return
 
         body = self.rfile.read(length)
-        backend = self.state.select()
+        backend = self.state.acquire()
         host, port = split_backend(backend)
         started = time.monotonic()
+        conn = None
         try:
             conn = http.client.HTTPConnection(host, port, timeout=self.state.timeout)
             forward_headers = {
@@ -141,10 +158,9 @@ class DispatcherHandler(BaseHTTPRequestHandler):
             if not self.wfile.closed:
                 self.send_error(502, f"backend unavailable: {exc}")
         finally:
-            try:
+            self.state.release(backend)
+            if conn is not None:
                 conn.close()
-            except UnboundLocalError:
-                pass
 
     def backend_health(self, backend: str) -> dict[str, object]:
         host, port = split_backend(backend)
