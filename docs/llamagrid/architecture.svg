@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="680" viewBox="0 0 1600 680" role="img" aria-labelledby="title desc">
+  <title id="title">LlamaGrid 14-worker request architecture</title>
+  <desc id="desc">Animated request packets travel from an application through Caddy and the LlamaGrid dispatcher to fourteen private llama-server replicas.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#08111f"/>
+      <stop offset="1" stop-color="#111827"/>
+    </linearGradient>
+    <linearGradient id="cyan" x1="0" x2="1"><stop stop-color="#22d3ee"/><stop offset="1" stop-color="#38bdf8"/></linearGradient>
+    <linearGradient id="violet" x1="0" x2="1"><stop stop-color="#a78bfa"/><stop offset="1" stop-color="#818cf8"/></linearGradient>
+    <filter id="glow-cyan"><feGaussianBlur stdDeviation="5" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    <filter id="glow-violet"><feGaussianBlur stdDeviation="4" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#64748b"/></marker>
+    <path id="route-a" d="M270 330 C360 330 390 330 470 330"/>
+    <path id="route-b" d="M700 330 C800 330 820 155 930 155"/>
+    <path id="route-c" d="M700 330 C800 330 820 235 930 235"/>
+    <path id="route-d" d="M700 330 C800 330 820 315 930 315"/>
+    <path id="route-e" d="M700 330 C800 330 820 395 930 395"/>
+    <path id="route-f" d="M700 330 C800 330 820 475 930 475"/>
+    <path id="route-g" d="M700 330 C800 330 820 555 930 555"/>
+  </defs>
+
+  <rect width="1600" height="680" rx="28" fill="url(#bg)"/>
+  <text x="800" y="58" text-anchor="middle" fill="#f8fafc" font-family="Inter,Segoe UI,sans-serif" font-size="30" font-weight="700">LlamaGrid · 14 independent CPU replicas</text>
+  <text x="800" y="91" text-anchor="middle" fill="#94a3b8" font-family="Inter,Segoe UI,sans-serif" font-size="16">OpenAI-compatible API · least-inflight routing · private worker network</text>
+
+  <g stroke="#334155" stroke-width="2" fill="none" marker-end="url(#arrow)">
+    <path d="M270 330 C360 330 390 330 470 330"/>
+    <path d="M700 330 C800 330 820 155 930 155"/>
+    <path d="M700 330 C800 330 820 235 930 235"/>
+    <path d="M700 330 C800 330 820 315 930 315"/>
+    <path d="M700 330 C800 330 820 395 930 395"/>
+    <path d="M700 330 C800 330 820 475 930 475"/>
+    <path d="M700 330 C800 330 820 555 930 555"/>
+  </g>
+
+  <g font-family="Inter,Segoe UI,sans-serif">
+    <rect x="70" y="260" width="200" height="140" rx="18" fill="#172033" stroke="#475569" stroke-width="2"/>
+    <text x="170" y="306" text-anchor="middle" fill="#f8fafc" font-size="22" font-weight="700">Application</text>
+    <text x="170" y="337" text-anchor="middle" fill="#94a3b8" font-size="15">OpenAI SDK / curl</text>
+    <text x="170" y="365" text-anchor="middle" fill="#67e8f9" font-size="14">HTTPS · Bearer auth</text>
+
+    <rect x="470" y="260" width="230" height="140" rx="18" fill="#172033" stroke="#22d3ee" stroke-width="2"/>
+    <text x="585" y="306" text-anchor="middle" fill="#f8fafc" font-size="22" font-weight="700">Caddy</text>
+    <text x="585" y="337" text-anchor="middle" fill="#94a3b8" font-size="15">TLS termination</text>
+    <text x="585" y="365" text-anchor="middle" fill="#67e8f9" font-size="14">api.beyra-ai.com</text>
+
+    <rect x="930" y="100" width="570" height="500" rx="22" fill="#0f172a" stroke="#818cf8" stroke-width="2"/>
+    <text x="1215" y="135" text-anchor="middle" fill="#c4b5fd" font-size="19" font-weight="700">Private cluster network · 10.50.0.0/24</text>
+    <g fill="#111d35" stroke="#6366f1" stroke-width="1.5">
+      <rect x="970" y="130" width="240" height="52" rx="12"/><rect x="1230" y="130" width="240" height="52" rx="12"/>
+      <rect x="970" y="210" width="240" height="52" rx="12"/><rect x="1230" y="210" width="240" height="52" rx="12"/>
+      <rect x="970" y="290" width="240" height="52" rx="12"/><rect x="1230" y="290" width="240" height="52" rx="12"/>
+      <rect x="970" y="370" width="240" height="52" rx="12"/><rect x="1230" y="370" width="240" height="52" rx="12"/>
+      <rect x="970" y="450" width="240" height="52" rx="12"/><rect x="1230" y="450" width="240" height="52" rx="12"/>
+      <rect x="970" y="530" width="240" height="52" rx="12"/><rect x="1230" y="530" width="240" height="52" rx="12"/>
+    </g>
+    <g fill="#e0e7ff" font-size="15" text-anchor="middle">
+      <text x="1090" y="162">Worker-01 · 10.50.0.21</text><text x="1350" y="162">Worker-02 · 10.50.0.22</text>
+      <text x="1090" y="242">Worker-03 · 10.50.0.3</text><text x="1350" y="242">Worker-04 · 10.50.0.4</text>
+      <text x="1090" y="322">Worker-05 · 10.50.0.5</text><text x="1350" y="322">Worker-06 · 10.50.0.6</text>
+      <text x="1090" y="402">Worker-07 · 10.50.0.7</text><text x="1350" y="402">Worker-08 · 10.50.0.8</text>
+      <text x="1090" y="482">Worker-09 · 10.50.0.9</text><text x="1350" y="482">Worker-10 · 10.50.0.10</text>
+      <text x="1090" y="562">Worker-11 · 10.50.0.11</text><text x="1350" y="562">Worker-12…14 · 10.50.0.12…14</text>
+    </g>
+  </g>
+
+  <g fill="url(#cyan)" filter="url(#glow-cyan)">
+    <circle r="7"><animateMotion dur="2.8s" repeatCount="indefinite" path="M270 330 C360 330 390 330 470 330"/></circle>
+    <circle r="7"><animateMotion dur="3.4s" begin="-.8s" repeatCount="indefinite" path="M700 330 C800 330 820 155 930 155"/></circle>
+    <circle r="7"><animateMotion dur="3.7s" begin="-1.5s" repeatCount="indefinite" path="M700 330 C800 330 820 315 930 315"/></circle>
+    <circle r="7"><animateMotion dur="3.1s" begin="-2.2s" repeatCount="indefinite" path="M700 330 C800 330 820 475 930 475"/></circle>
+  </g>
+  <g fill="url(#violet)" filter="url(#glow-violet)">
+    <circle r="6"><animateMotion dur="3.0s" begin="-1.2s" repeatCount="indefinite" path="M930 182 C820 182 800 330 700 330"/></circle>
+    <circle r="6"><animateMotion dur="3.6s" begin="-.4s" repeatCount="indefinite" path="M930 402 C820 402 800 330 700 330"/></circle>
+  </g>
+
+  <text x="800" y="650" text-anchor="middle" fill="#64748b" font-family="Inter,Segoe UI,sans-serif" font-size="14">One request → one healthy replica · concurrent requests → least-inflight distribution · SSE returns immediately</text>
+</svg>

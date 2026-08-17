@@ -1,3 +1,474 @@
+# LlamaGrid — Production Qwen3-Coder-Next Inference Grid
+
+[![API](https://img.shields.io/badge/API-OpenAI--compatible-10b981.svg)](https://api.beyra-ai.com/v1)
+[![Workers](https://img.shields.io/badge/replicas-14-6366f1.svg)](https://github.com/BehnamJalaliCo/LLAMA-Grid)
+[![Transport](https://img.shields.io/badge/transport-HTTPS%20%2B%20SSE-06b6d4.svg)](https://api.beyra-ai.com/health)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+> A production-oriented request-level inference grid built on `ik_llama.cpp`: fourteen complete CPU replicas, least-inflight routing, an OpenAI-compatible API, HTTPS termination, health-aware admission, structured logs, metrics, and immediate SSE streaming.
+
+> یک شبکه‌ی inference عملیاتی و قابل‌توسعه بر پایه‌ی `ik_llama.cpp`: چهارده replica کامل CPU، مسیریابی least-inflight، API سازگار با OpenAI، HTTPS، health-aware admission، لاگ ساخت‌یافته، metrics و SSE فوری.
+
+## Executive summary · خلاصه‌ی اجرایی
+
+### English
+
+LlamaGrid is the production architecture built around this repository for serving **Qwen3-Coder-Next 80B Q4_K_M**. Each worker owns a complete model replica. The dispatcher assigns each request to one healthy replica and never splits one request across workers. This makes the system predictable, observable, and horizontally scalable for concurrent requests.
+
+The public contract is OpenAI-compatible. Clients use `https://api.beyra-ai.com/v1`, authenticate with a Bearer key, and call `/v1/models`, `/v1/chat/completions`, or `/v1/completions`. Caddy terminates TLS on Model-Hub; the dispatcher is localhost-only; workers remain private.
+
+### فارسی
+
+LlamaGrid معماری production این repository برای سرویس‌دهی به **Qwen3-Coder-Next 80B Q4_K_M** است. هر Worker یک replica کامل از مدل دارد. Dispatcher هر درخواست را به یک replica سالم اختصاص می‌دهد و هیچ درخواست واحدی را بین Workerها تقسیم نمی‌کند. نتیجه، سیستمی قابل‌پیش‌بینی، قابل‌مشاهده و قابل‌گسترش برای درخواست‌های هم‌زمان است.
+
+قرارداد عمومی با OpenAI سازگار است. کلاینت به `https://api.beyra-ai.com/v1` وصل می‌شود، با Bearer key احراز هویت می‌کند و از `/v1/models`، `/v1/chat/completions` یا `/v1/completions` استفاده می‌کند. Caddy روی Model-Hub TLS را terminate می‌کند، dispatcher فقط localhost است و Workerها خصوصی باقی می‌مانند.
+
+## Current deployment · وضعیت فعلی
+
+| Dimension | Current value | شرح فارسی |
+|---|---|---|
+| Public base URL | `https://api.beyra-ai.com/v1` | آدرس عمومی سرویس |
+| External model ID | `qwen3-coder-next` | نام مدل عمومی |
+| Model | Qwen3-Coder-Next 80B, `Q4_K_M` | مدل کامل روی هر replica |
+| Dispatcher | `127.0.0.1:18080` | dispatcher فقط روی Hub |
+| Public edge | Caddy on `80/443` | TLS و reverse proxy |
+| Backends | 14 independent `llama-server` replicas | چهارده replica مستقل |
+| Routing | Least-inflight among healthy workers | کمترین بار در میان سالم‌ها |
+| Placement | One request → one replica | هر درخواست روی یک replica |
+| Auth | `Authorization: Bearer <API_KEY>` | احراز هویت Bearer |
+| Streaming | SSE, no full-response buffering | streaming فوری |
+| Services | `llamagrid-api.service` + `caddy.service` | سرویس‌های دائمی |
+
+## Live architecture · معماری زنده
+
+<p align="center">
+  <img src="docs/llamagrid/architecture.svg" alt="Animated LlamaGrid architecture from application through Caddy and dispatcher to fourteen private replicas" width="100%">
+</p>
+
+The animated SVG is a repository asset, not an external dependency. It can be replaced later without changing the API contract.
+
+این SVG متحرک داخل repository نگه‌داری می‌شود و dependency خارجی نیست؛ در آینده بدون تغییر قرارداد API قابل‌تعویض است.
+
+```mermaid
+flowchart LR
+    A[Application / OpenAI SDK] -->|HTTPS + Bearer key| B[api.beyra-ai.com]
+    B --> C[Caddy TLS termination]
+    C -->|127.0.0.1:18080| D[LlamaGrid dispatcher]
+    D -->|least-inflight| W[14 private llama-server replicas]
+    W --> M[Complete Qwen3-Coder-Next replica per worker]
+```
+
+### Core decisions · تصمیم‌های اصلی
+
+| Principle | English decision | تصمیم فارسی |
+|---|---|---|
+| Isolation | One complete replica serves one request. | هر درخواست روی یک replica کامل اجرا می‌شود. |
+| Predictability | No production cross-worker tensor movement. | در مسیر production کپی tensor بین Workerها نداریم. |
+| Scale-out | More replicas increase concurrent-request capacity. | افزودن replica ظرفیت درخواست هم‌زمان را زیاد می‌کند. |
+| Safety | Only Caddy is public; workers are private. | فقط Caddy عمومی است؛ Workerها خصوصی‌اند. |
+| Recovery | Failed workers leave selection and recovered workers re-enter. | Worker خراب خارج و Worker بازیابی‌شده دوباره وارد می‌شود. |
+| Extensibility | Explicit backends, API, metrics, and service files. | backend، API، metrics و service صریح و قابل‌تغییرند. |
+
+## Request lifecycle · چرخه‌ی درخواست
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as Client / Application
+    participant Caddy as Caddy HTTPS
+    participant Grid as LlamaGrid
+    participant Worker as Healthy replica
+    App->>Caddy: POST /v1/chat/completions + Bearer key
+    Caddy->>Grid: Reverse proxy to localhost
+    Grid->>Grid: Authenticate and validate model
+    Grid->>Grid: Select least-inflight healthy worker
+    Grid->>Worker: Forward one complete request
+    Worker-->>Grid: JSON or SSE stream
+    Grid-->>Caddy: Flush bytes immediately
+    Caddy-->>App: OpenAI-compatible response
+    Grid->>Grid: Log request and token counters
+```
+
+### Routing and recovery
+
+1. Startup probes all configured workers.
+2. Only healthy workers participate in selection.
+3. The lowest in-flight count wins; ties rotate fairly.
+4. Transport failures and backend HTTP 5xx responses mark a worker unhealthy.
+5. A background health loop probes every five seconds and re-admits recovered workers.
+6. `/ready` returns HTTP 200 only when all fourteen workers pass direct checks.
+7. SSE bytes are forwarded immediately; the dispatcher does not wait for the full answer.
+
+### مسیریابی و بازیابی
+
+۱. در startup همه‌ی Workerها probe می‌شوند.
+۲. فقط Workerهای سالم در انتخاب شرکت می‌کنند.
+۳. کمترین in-flight انتخاب می‌شود و در تساوی rotation انجام می‌شود.
+۴. خطای شبکه و HTTP 5xx، Worker را unhealthy می‌کند.
+۵. health loop هر پنج ثانیه Worker بازیابی‌شده را دوباره وارد می‌کند.
+۶. `/ready` فقط وقتی HTTP 200 می‌دهد که هر چهارده Worker سالم باشند.
+۷. chunkهای SSE فوری forward می‌شوند و پاسخ کامل buffer نمی‌شود.
+
+## Cluster topology · توپولوژی cluster
+
+### Model-Hub
+
+| Node | Private address | Role | Listening surface |
+|---|---:|---|---|
+| Model-Hub | `10.50.0.2` | Caddy + dispatcher | `*:80`, `*:443`, `127.0.0.1:18080` |
+
+### Worker replicas
+
+All workers use the same compatible binary, model files, and stable runtime policy:
+`-t 24 -tb 24 -c 4096 -b 2048 -ub 1024 -np 1 -fa 1 -gr`.
+
+همه‌ی Workerها از binary، model files و runtime policy یکسان استفاده می‌کنند:
+`-t 24 -tb 24 -c 4096 -b 2048 -ub 1024 -np 1 -fa 1 -gr`.
+
+| Worker | Private IP | Port | Hardware | Loaded state |
+|---|---:|---:|---|---|
+| Worker-01 | `10.50.0.21` | `8080` | AMD EPYC Milan · 24P/48L · 1 NUMA | 79.674B · ~45.081 GiB |
+| Worker-02 | `10.50.0.22` | `8080` | AMD EPYC Milan · 24P/48L · 1 NUMA | 79.674B · ~45.081 GiB |
+| Worker-03 | `10.50.0.3` | `8080` | AMD EPYC Milan · 24P/48L · 1 NUMA | 79.674B · ~45.081 GiB |
+| Worker-04 | `10.50.0.4` | `8080` | AMD EPYC Milan · 24P/48L · 1 NUMA | 79.674B · ~45.081 GiB |
+| Worker-05 | `10.50.0.5` | `8080` | AMD EPYC Milan · 24P/48L · 1 NUMA | 79.674B · ~45.081 GiB |
+| Worker-06 | `10.50.0.6` | `8080` | AMD EPYC Milan · 24P/48L · 1 NUMA | 79.674B · ~45.081 GiB |
+| Worker-07 | `10.50.0.7` | `8080` | AMD EPYC Milan · 24P/48L · 1 NUMA | 79.674B · ~45.081 GiB |
+| Worker-08 | `10.50.0.8` | `8080` | AMD EPYC Milan · 24P/48L · 1 NUMA | 79.674B · ~45.081 GiB |
+| Worker-09 | `10.50.0.9` | `8080` | AMD EPYC Milan · 24P/48L · 1 NUMA | 79.674B · ~45.081 GiB |
+| Worker-10 | `10.50.0.10` | `8080` | AMD EPYC Milan · 24P/48L · 1 NUMA | 79.674B · ~45.081 GiB |
+| Worker-11 | `10.50.0.11` | `8080` | AMD EPYC Milan · 24P/48L · 1 NUMA | 79.674B · ~45.081 GiB |
+| Worker-12 | `10.50.0.12` | `8080` | AMD EPYC Milan · 24P/48L · 1 NUMA | 79.674B · ~45.081 GiB |
+| Worker-13 | `10.50.0.13` | `8080` | AMD EPYC Milan · 24P/48L · 1 NUMA | 79.674B · ~45.081 GiB |
+| Worker-14 | `10.50.0.14` | `8080` | AMD EPYC Milan · 24P/48L · 1 NUMA | 79.674B · ~45.081 GiB |
+
+> **Replica trade-off:** full replicas maximize concurrent-request throughput and avoid graph-over-RPC decode barriers, but multiply model memory. A single request still uses one worker.
+>
+> **trade-off replica:** replica کامل throughput درخواست‌های هم‌زمان را بالا می‌برد و barrierهای graph-over-RPC را حذف می‌کند، اما مصرف حافظه را چند برابر می‌کند. هر درخواست واحد همچنان روی یک Worker است.
+
+### Provisioning record · سابقه‌ی provision
+
+| Item | Recorded state |
+|---|---|
+| Worker-03…14 infrastructure | Hetzner `ccx63`, Ubuntu 24.04, private cluster network |
+| Runtime dependency | `libgomp1` installed where required |
+| Model distribution | Four GGUF shards synchronized to every replica; each new node received 48,410,992,032 bytes |
+| Binary consistency | `llama-server`, `libllama.so`, `libggml.so`, and `libmtmd.so` hashes matched across Hub and workers |
+| Legacy RPC surface | RPC port `50052` stopped; final production data plane uses HTTP replica endpoints on private `8080` |
+
+این جدول شواهد زیرساختی را برای reproducibility نگه می‌دارد: nodeهای جدید با image یکسان، dependency یکسان، shardهای کامل و binaryهای hash-matched وارد fleet شدند.
+
+## Public API · API عمومی
+
+Base URL: `https://api.beyra-ai.com/v1`
+
+| Method | Endpoint | Auth | Purpose |
+|---|---|---|---|
+| `GET` | `/health` | Public | Dispatcher status and in-flight state |
+| `GET` | `/ready` | Public | Direct check of all 14 workers |
+| `GET` | `/metrics` | Bearer key | Prometheus-style counters and backend state |
+| `GET` | `/v1/models` | Bearer key | OpenAI model discovery |
+| `POST` | `/v1/chat/completions` | Bearer key | Chat JSON or SSE |
+| `POST` | `/v1/completions` | Bearer key | Text completion JSON or SSE |
+
+| متد | Endpoint | احراز هویت | کاربرد |
+|---|---|---|---|
+| `GET` | `/health` | عمومی | وضعیت dispatcher و in-flight |
+| `GET` | `/ready` | عمومی | بررسی هر ۱۴ Worker |
+| `GET` | `/metrics` | Bearer key | متریک و وضعیت backend |
+| `GET` | `/v1/models` | Bearer key | کشف مدل |
+| `POST` | `/v1/chat/completions` | Bearer key | chat معمولی یا SSE |
+| `POST` | `/v1/completions` | Bearer key | text completion معمولی یا SSE |
+
+### Authentication · احراز هویت
+
+The API secret is intentionally absent from Git. It is stored on the production host at `/etc/llamagrid/api.env` with mode `600` and loaded by systemd. Never place the value in this README, a commit, a command line, or a public issue.
+
+secret عمداً در Git نیست و روی host در `/etc/llamagrid/api.env` با mode `600` نگه‌داری و توسط systemd بارگذاری می‌شود. مقدار آن را در README، commit، command line یا issue عمومی قرار ندهید.
+
+```bash
+export LLAMAGRID_API_KEY='<read from /etc/llamagrid/api.env>'
+```
+
+### Model discovery · کشف مدل
+
+```bash
+curl -sS https://api.beyra-ai.com/v1/models \
+  -H "Authorization: Bearer $LLAMAGRID_API_KEY"
+```
+
+### Non-streaming chat · chat بدون streaming
+
+```bash
+curl -sS https://api.beyra-ai.com/v1/chat/completions \
+  -H "Authorization: Bearer $LLAMAGRID_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model":"qwen3-coder-next",
+    "messages":[{"role":"user","content":"Write a short Python hello world program."}],
+    "stream":false,
+    "max_tokens":128
+  }'
+```
+
+### Streaming chat · chat به‌صورت streaming
+
+```bash
+curl -N https://api.beyra-ai.com/v1/chat/completions \
+  -H "Authorization: Bearer $LLAMAGRID_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model":"qwen3-coder-next",
+    "messages":[{"role":"user","content":"Write a short Python hello world program."}],
+    "stream":true,
+    "max_tokens":128
+  }'
+```
+
+The response is SSE: each `data:` frame is flushed immediately and the stream ends with `data: [DONE]`.
+
+پاسخ SSE است؛ هر frame با `data:` فوری flush می‌شود و stream با `data: [DONE]` پایان می‌یابد.
+
+### Text completion · تکمیل متن
+
+```bash
+curl -sS https://api.beyra-ai.com/v1/completions \
+  -H "Authorization: Bearer $LLAMAGRID_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model":"qwen3-coder-next",
+    "prompt":"Write one concise Python function that adds two integers.",
+    "stream":false,
+    "max_tokens":64
+  }'
+```
+
+## Operations · عملیات
+
+### Repository and host files · فایل‌های repository و host
+
+| Path | Responsibility | مسئولیت فارسی |
+|---|---|---|
+| `tools/qwen_replica_dispatcher.py` | Auth, OpenAI routes, routing, SSE, health, metrics, logs | dispatcher اصلی |
+| `docs/llamagrid/architecture.svg` | Animated architecture asset | asset انیمیشن |
+| `/etc/llamagrid/api.env` | Host-only API secret; never commit | secret فقط روی host |
+| `/etc/systemd/system/llamagrid-api.service` | Persistent dispatcher | سرویس دائمی |
+| `/etc/caddy/Caddyfile` | HTTPS reverse proxy | reverse proxy و TLS |
+| `/opt/models/qwen3-coder-next/` | Four-file GGUF model split | shardهای مدل |
+
+### Stable worker policy · policy پایدار Worker
+
+```bash
+/opt/ik_llama.cpp/build/bin/llama-server \
+  -m /opt/models/qwen3-coder-next/Qwen3-Coder-Next-Q4_K_M-00001-of-00004.gguf \
+  --host 10.50.0.X --port 8080 \
+  -t 24 -tb 24 -c 4096 -b 2048 -ub 1024 -np 1 \
+  -fa 1 -gr --webui none --metrics --no-display-prompt
+```
+
+Do not bind worker `8080` to a public interface. Do not change this performance policy during API-only work.
+
+پورت `8080` را روی interface عمومی bind نکنید و در کارهای API-only این policy عملکرد را تغییر ندهید.
+
+### Systemd and Caddy
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now llamagrid-api.service
+sudo systemctl enable --now caddy.service
+sudo systemctl status llamagrid-api.service caddy.service --no-pager
+sudo journalctl -u llamagrid-api.service -f
+```
+
+The dispatcher binds to `127.0.0.1:18080`; Caddy exposes only the HTTPS edge. `flush_interval -1` is required for low-latency SSE.
+
+dispatcher فقط روی `127.0.0.1:18080` است و Caddy تنها edge عمومی را expose می‌کند. `flush_interval -1` برای SSE کم‌تاخیر لازم است.
+
+### Health and metrics
+
+```bash
+curl -fsS https://api.beyra-ai.com/health
+curl -fsS https://api.beyra-ai.com/ready
+curl -sS https://api.beyra-ai.com/metrics \
+  -H "Authorization: Bearer $LLAMAGRID_API_KEY"
+```
+
+`/health` is lightweight. `/ready` is the deployment gate. `/metrics` contains request totals, error totals, token totals, backend health, and in-flight counts.
+
+`/health` سبک است، `/ready` دروازه‌ی deployment است و `/metrics` مجموع درخواست، خطا، token، health backend و in-flight را دارد.
+
+## Observability · مشاهده‌پذیری
+
+Every proxied request emits one structured JSON record to journald. It includes request ID, selected worker, status, latency, and token counts when available. Authorization headers, API keys, prompts, and generated text are never logged.
+
+هر درخواست proxy‌شده یک JSON ساخت‌یافته به journald می‌فرستد که شامل request ID، Worker، status، latency و token count است. Authorization، API key، prompt و متن تولیدشده log نمی‌شوند.
+
+```json
+{"event":"request","request_id":"...","path":"/v1/chat/completions","worker":"10.50.0.3:8080","status":200,"latency_ms":412.7,"input_tokens":14,"output_tokens":8}
+```
+
+## Engineering record · سابقه‌ی مهندسی
+
+The final architecture is the result of a deliberate investigation, not a shortcut around correctness. This record preserves the important decisions so a future maintainer can distinguish solved problems from intentional boundaries.
+
+معماری نهایی نتیجه‌ی بررسی مهندسی و حفظ correctness است، نه دور زدن خطاها. این سابقه کمک می‌کند maintainer آینده مشکل حل‌شده را از محدودیت عمدی معماری تشخیص دهد.
+
+| Stage | Evidence | Decision |
+|---|---|---|
+| Distributed graph/RPC exploration | Two workers received real graph splits; the earlier one-worker RPC baseline reached approximately 238 prompt tok/s and 28 decode tok/s. | Keep the experiment reproducible, but do not call it the final low-batch production architecture. |
+| Context lifetime | An RPC heap-use-after-free appeared during context destruction; the local fix later completed under ASAN with exit code 0. | Preserve the lifetime fix and require sanitizer validation for future RPC changes. |
+| CPU reduction | `GGML_OP_REDUCE` was missing from the CPU backend; a reduce-add implementation was added in `ggml/src/ggml.c`. | Keep reduction semantics explicit and tested. |
+| Tensor ownership | RPC bounds assertions caught scheduler-created views whose data pointer was outside the receiving buffer range. | Never remove or weaken bounds assertions; fix ownership/copy/view semantics instead. |
+| Scheduler semantics | `ggml_reduce` is a view of the last source; `ggml_fake_cpy` uses `src[0]` for the destination and `src[1]` for the source. | Treat view ownership and source-index mapping as correctness-critical. |
+| Allocation reporting | Multi-backend graph/RPC runs could report approximately 158.93B parameters / 90.51 GiB because two complete states were aggregated in the report. | Interpret aggregate allocation counters separately from per-model state. |
+| Production decision | Graph-over-RPC decode exposed synchronization, copy, and barrier costs at low batch. | Use independent full replicas with request-level dispatch for production. |
+
+### What remains true · چه چیزی همچنان معتبر است
+
+- The repository retains the functional graph/RPC and CPU backend work; the public production API does not depend on splitting one decode across workers.
+- Bounds assertions remain part of the safety model.
+- A full replica is approximately 79.674B parameters and ~45.081 GiB of loaded state; aggregate fleet memory is the per-replica value multiplied by the number of replicas.
+- The production cluster scales **concurrent requests**, not the compute of one request across fourteen machines.
+
+- کد graph/RPC و کار CPU backend در repository باقی مانده است؛ API production عمومی به split کردن decode بین Workerها وابسته نیست.
+- bounds assertionها بخشی از مدل ایمنی باقی می‌مانند.
+- هر replica کامل تقریباً 79.674B پارامتر و ~45.081 GiB state دارد؛ حافظه‌ی کل fleet برابر مقدار هر replica ضربدر تعداد replicaهاست.
+- cluster production ظرفیت **درخواست‌های هم‌زمان** را scale می‌کند، نه compute یک درخواست روی چهارده ماشین.
+
+## Measured performance · عملکرد اندازه‌گیری‌شده
+
+These are wall-clock measurements from the stable fourteen-replica architecture. They are capacity evidence, not a guarantee for every prompt or context.
+
+این‌ها اندازه‌گیری wall-clock از معماری پایدار چهارده replica هستند؛ برای ظرفیت‌سنجی‌اند و تضمین هر prompt یا context نیستند.
+
+| Workload | Wall time | Requests | Input tokens | Output tokens | Aggregate |
+|---|---:|---:|---:|---:|---:|
+| Fixed prompt, 512 tokens, `n_predict=1` | 61.64 s | 481 | 246,272 | 481 | **3,995 input tok/s** |
+| Fixed prompt, 1024 tokens, `n_predict=1` | 62.98 s | 262 | 268,288 | 262 | **4,260 input tok/s** |
+| Continuous decode, 14-way, `n_predict=256` | 67.98 s | 115 | 8,199 | 29,440 | **433.09 output tok/s** |
+
+| Signal | Value |
+|---|---:|
+| Decode p50 latency | 7.765 s |
+| Decode p95 latency | 8.576 s |
+| Worker CPU busy | approximately 41–44% |
+| Model-Hub CPU busy | approximately 0.85% |
+| Errors | 0 |
+
+Prefill scales with concurrent requests because replicas work independently. Decode throughput is bounded by per-replica generation speed; more replicas raise aggregate concurrent capacity, while one request still uses one replica.
+
+در prefill، replicaهای مستقل با درخواست هم‌زمان scale می‌شوند. در decode، سرعت هر replica محدودکننده است؛ replica بیشتر ظرفیت aggregate را بالا می‌برد، اما هر درخواست فقط یک replica دارد.
+
+## Verification matrix · ماتریس اعتبارسنجی
+
+| Check | Expected | Result |
+|---|---|---|
+| TLS | Valid certificate for `api.beyra-ai.com` | Passed |
+| `/health` | HTTP 200 | Passed |
+| `/ready` | HTTP 200, 14/14 healthy | Passed |
+| `/v1/models` | HTTP 200, `qwen3-coder-next` | Passed |
+| Non-stream chat | OpenAI JSON, HTTP 200 | Passed |
+| SSE chat | `data:` frames then `[DONE]` | Passed |
+| Missing key | HTTP 401 | Passed |
+| 14 concurrent requests | 14 distinct `X-Backend` values | Passed |
+| Worker exposure | No public worker `8080` listener | Passed |
+
+## Safe change guide · راهنمای تغییر امن
+
+### Adding a worker · افزودن Worker
+
+1. Provision the node on the private network with the same runtime dependencies.
+2. Copy the exact compatible binary and all GGUF shards.
+3. Start `llama-server` on the private IP only.
+4. Add one `--backend PRIVATE_IP:8080` line to the service unit.
+5. Run `systemctl daemon-reload && systemctl restart llamagrid-api`.
+6. Confirm `/ready` and a concurrent public request test.
+7. Record binary hashes, model hashes, topology, memory, and throughput.
+
+۱. Node را روی شبکه‌ی خصوصی آماده کنید.
+۲. binary سازگار و همه‌ی shardها را کپی کنید.
+۳. `llama-server` را فقط روی private IP اجرا کنید.
+۴. یک خط `--backend PRIVATE_IP:8080` به unit اضافه کنید.
+۵. `systemctl daemon-reload && systemctl restart llamagrid-api` را اجرا کنید.
+۶. `/ready` و تست concurrent عمومی را تأیید کنید.
+۷. hashها، topology، حافظه و throughput را ثبت کنید.
+
+### API changes · تغییرات API
+
+- Preserve `/health`, `/ready`, and `/metrics` semantics.
+- Keep `qwen3-coder-next` stable unless a versioned API contract is introduced.
+- Never forward Authorization to workers.
+- Never add full-response buffering to the SSE path.
+- Test authentication, malformed input, JSON, SSE, failover, and concurrency.
+- Update the endpoint table, examples, verification matrix, and performance table together.
+
+- semantics health را حفظ کنید.
+- `qwen3-coder-next` را بدون قرارداد versioned تغییر ندهید.
+- Authorization را به Workerها forward نکنید.
+- در مسیر SSE پاسخ کامل را buffer نکنید.
+- auth، ورودی خراب، JSON، SSE، failover و concurrency را تست کنید.
+- جدول endpoint، مثال، verification و performance را هم‌زمان به‌روزرسانی کنید.
+
+### Operational checklist · چک‌لیست
+
+```bash
+python3 -m py_compile tools/qwen_replica_dispatcher.py
+git diff --check
+sudo caddy validate --config /etc/caddy/Caddyfile
+sudo systemctl is-active llamagrid-api.service caddy.service
+curl -fsS https://api.beyra-ai.com/health
+curl -fsS https://api.beyra-ai.com/ready
+```
+
+## Trade-offs and boundaries · trade-off و مرزها
+
+| Decision | Benefit | Cost / boundary |
+|---|---|---|
+| Full replica per worker | Simple failure domain and concurrent throughput | Model memory is multiplied |
+| Request-level routing | No tensor-copy or decode barrier | One request cannot use all workers |
+| `np=1` | Predictable per-worker behavior | Per-replica concurrency is limited |
+| Public Caddy edge | Automatic TLS and one public surface | Caddy is an edge dependency |
+| Model allow-list | Prevents model mismatch | Multiple models need explicit versioning |
+
+The project deliberately does not claim graph-over-RPC is the fastest low-batch decode architecture. The production choice is a replica grid because it produced stable request-level scaling and clear operational boundaries.
+
+این پروژه ادعا نمی‌کند graph-over-RPC برای decode کم‌batch سریع‌ترین معماری است. انتخاب production، replica grid است چون scaling در سطح درخواست و مرز عملیاتی روشن و پایدار می‌دهد.
+
+## Repository map · نقشه‌ی repository
+
+```text
+.
+├── tools/qwen_replica_dispatcher.py   # API and routing control plane
+├── docs/llamagrid/architecture.svg    # Animated architecture asset
+├── ggml/                              # Tensor graph and backend implementation
+├── src/                               # llama.cpp runtime and server integration
+├── examples/server/                   # Server examples
+├── docs/                              # Build and development documentation
+└── README.md                          # This bilingual deployment guide
+```
+
+## Roadmap · نقشه‌ی راه
+
+1. API versioning for breaking changes.
+2. Inventory-driven backend generation with reviewed service output.
+3. Prometheus/Grafana dashboards without secret exposure.
+4. Per-key quotas, concurrency limits, and admission control.
+5. Release records containing binary/model hashes, topology, benchmark command, and `/ready` evidence.
+
+۱. versioning برای breaking change.
+۲. تولید backend از inventory با review خروجی service.
+۳. dashboardهای Prometheus/Grafana بدون افشای secret.
+۴. quota، concurrency limit و admission control.
+۵. ثبت hash، topology، benchmark و شواهد `/ready` برای هر release.
+
+## Upstream ik_llama.cpp documentation
+
+The original `ik_llama.cpp` documentation is preserved below. It covers the underlying runtime, build system, quantization features, GPU backends, examples, and upstream development history.
+
+مستندات اصلی `ik_llama.cpp` در ادامه حفظ شده و runtime، build system، quantization، backendهای GPU، مثال‌ها و تاریخچه‌ی upstream را پوشش می‌دهد.
+
+---
+
 # ik_llama.cpp: llama.cpp fork with better CPU performance
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
