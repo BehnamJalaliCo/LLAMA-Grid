@@ -19,17 +19,25 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
-DEFAULT_BACKENDS = ("10.50.0.21:8080", "10.50.0.22:8080")
-MODEL_NAME = "qwen3-coder-next"
-PROXY_PATHS = {"/completion", "/v1/completions", "/v1/chat/completions"}
-OPENAI_PROXY_PATHS = {"/v1/completions", "/v1/chat/completions"}
+PROXY_PATHS = {"/completion", "/v1/completions", "/v1/chat/completions", "/v1/responses"}
+OPENAI_PROXY_PATHS = {"/v1/completions", "/v1/chat/completions", "/v1/responses"}
 PUBLIC_PATHS = {"/health", "/ready"}
 REQUEST_ID_RE = re.compile(r"[^A-Za-z0-9_.:-]")
+MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+/-]{0,199}$")
 
 
 class DispatcherState:
-    def __init__(self, backends: tuple[str, ...], timeout: float, health_interval: float) -> None:
+    def __init__(
+        self,
+        backends: tuple[str, ...],
+        model_name: str,
+        model_owner: str,
+        timeout: float,
+        health_interval: float,
+    ) -> None:
         self.backends = backends
+        self.model_name = model_name
+        self.model_owner = model_owner
         self.timeout = timeout
         self.health_interval = health_interval
         self.condition = threading.Condition()
@@ -164,10 +172,42 @@ class DispatcherState:
 
 
 def split_backend(backend: str) -> tuple[str, int]:
+    backend = backend.strip()
+    if backend.startswith("[") and "]" in backend:
+        host, separator, port = backend[1:].partition("]:")
+        if separator:
+            return validate_backend_host(host), validate_backend_port(port)
     host, sep, port = backend.rpartition(":")
     if not sep:
-        return backend, 8080
-    return host, int(port)
+        return validate_backend_host(backend), 8080
+    return validate_backend_host(host), validate_backend_port(port)
+
+
+def validate_backend_host(host: str) -> str:
+    if not host or any(character.isspace() or character in "#/" for character in host):
+        raise ValueError("backend host is invalid")
+    return host
+
+
+def validate_backend_port(port: str) -> int:
+    try:
+        value = int(port, 10)
+    except ValueError as error:
+        raise ValueError("backend port is invalid") from error
+    if not 1 <= value <= 65_535:
+        raise ValueError("backend port is invalid")
+    return value
+
+
+def parse_backends(value: str) -> tuple[str, ...]:
+    entries = tuple(item.strip() for item in value.split(",") if item.strip())
+    if not entries:
+        raise ValueError("at least one backend must be configured")
+    for entry in entries:
+        split_backend(entry)
+    if len(set(entries)) != len(entries):
+        raise ValueError("backend entries must be unique")
+    return entries
 
 
 class DispatcherHandler(BaseHTTPRequestHandler):
@@ -206,10 +246,10 @@ class DispatcherHandler(BaseHTTPRequestHandler):
                 200,
                 {
                     "status": "ok",
-                    "backends": list(self.state.backends),
+                    "backend_count": len(self.state.backends),
+                    "healthy_backends": sum(self.state.health_snapshot().values()),
                     "mode": "least_inflight",
-                    "inflight": self.state.snapshot(),
-                    "healthy": self.state.health_snapshot(),
+                    "inflight_total": sum(self.state.snapshot().values()),
                 },
                 {"X-Request-ID": request_id},
             )
@@ -217,7 +257,15 @@ class DispatcherHandler(BaseHTTPRequestHandler):
         if self.path == "/ready":
             statuses = self.state.refresh_health()
             code = 200 if all(item["ok"] for item in statuses) else 503
-            self.send_json(code, {"status": "ok" if code == 200 else "degraded", "backends": statuses}, {"X-Request-ID": request_id})
+            self.send_json(
+                code,
+                {
+                    "status": "ok" if code == 200 else "degraded",
+                    "backend_count": len(statuses),
+                    "healthy_backends": sum(bool(item["ok"]) for item in statuses),
+                },
+                {"X-Request-ID": request_id},
+            )
             return
         if self.path == "/metrics":
             if not self.require_auth():
@@ -237,7 +285,7 @@ class DispatcherHandler(BaseHTTPRequestHandler):
                 200,
                 {
                     "object": "list",
-                    "data": [{"id": MODEL_NAME, "object": "model", "created": int(time.time()), "owned_by": "beyra-ai"}],
+                    "data": [{"id": self.state.model_name, "object": "model", "created": int(time.time()), "owned_by": self.state.model_owner}],
                 },
                 {"X-Request-ID": request_id},
             )
@@ -276,10 +324,10 @@ class DispatcherHandler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": {"message": "Request body must be a JSON object", "type": "invalid_request_error"}})
                 return
             model = request_json.get("model")
-            if model is not None and model != MODEL_NAME:
+            if model is not None and model != self.state.model_name:
                 self.send_json(404, {"error": {"message": f"Model '{model}' is not available", "type": "invalid_request_error"}})
                 return
-            request_json["model"] = MODEL_NAME
+            request_json["model"] = self.state.model_name
             stream_requested = bool(request_json.get("stream", False))
             body = json.dumps(request_json, separators=(",", ":")).encode("utf-8")
 
@@ -431,18 +479,25 @@ def log_request(request_id: str, path: str, backend: str, status: int, elapsed: 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--listen", default="10.50.0.2")
-    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--listen", default=os.environ.get("LLAMAGRID_LISTEN_HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("LLAMAGRID_LISTEN_PORT", "18080")))
     parser.add_argument("--backend", action="append", dest="backends", default=[])
-    parser.add_argument("--timeout", type=float, default=900.0)
-    parser.add_argument("--health-interval", type=float, default=5.0)
+    parser.add_argument("--model-name", default=os.environ.get("LLAMAGRID_MODEL_NAME", ""))
+    parser.add_argument("--model-owner", default=os.environ.get("LLAMAGRID_MODEL_OWNER", "llamagrid"))
+    parser.add_argument("--timeout", type=float, default=float(os.environ.get("LLAMAGRID_REQUEST_TIMEOUT", "900")))
+    parser.add_argument("--health-interval", type=float, default=float(os.environ.get("LLAMAGRID_HEALTH_INTERVAL", "5")))
     args = parser.parse_args()
-    backends = tuple(args.backends) if args.backends else DEFAULT_BACKENDS
-    if not backends:
-        raise SystemExit("at least one --backend is required")
+    try:
+        backends = parse_backends(",".join(args.backends) if args.backends else os.environ.get("LLAMAGRID_BACKENDS", ""))
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    if not args.model_name or MODEL_NAME_RE.fullmatch(args.model_name) is None:
+        raise SystemExit("a valid --model-name or LLAMAGRID_MODEL_NAME is required")
+    if not args.model_owner:
+        raise SystemExit("--model-owner or LLAMAGRID_MODEL_OWNER is required")
     if not os.environ.get("LLAMAGRID_API_KEY"):
         raise SystemExit("LLAMAGRID_API_KEY is required")
-    state = DispatcherState(backends, args.timeout, args.health_interval)
+    state = DispatcherState(backends, args.model_name, args.model_owner, args.timeout, args.health_interval)
     DispatcherHandler.state = state
     state.start()
     server = ThreadingHTTPServer((args.listen, args.port), DispatcherHandler)

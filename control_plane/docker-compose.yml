@@ -1,0 +1,101 @@
+name: llamagrid-control-plane
+
+services:
+  postgres:
+    image: ${TIMESCALE_IMAGE:-timescale/timescaledb:latest-pg16}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-llamagrid}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+      POSTGRES_DB: ${POSTGRES_DB:-llamagrid}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-llamagrid}:${POSTGRES_PASSWORD:-change-me}@postgres:5432/${POSTGRES_DB:-llamagrid}
+      REDIS_URL: redis://redis:6379/0
+      DISPATCHER_URL: ${DISPATCHER_URL:?set DISPATCHER_URL in .env}
+      DISPATCHER_API_KEY: ${LLAMAGRID_API_KEY:-}
+      PUBLIC_MODEL_ID: ${PUBLIC_MODEL_ID:-default-model}
+      PUBLIC_MODEL_DISPLAY_NAME: ${PUBLIC_MODEL_DISPLAY_NAME:-Configured model}
+      PUBLIC_MODEL_CONTEXT_LENGTH: ${PUBLIC_MODEL_CONTEXT_LENGTH:-0}
+      PUBLIC_MODEL_QUANTIZATION: ${PUBLIC_MODEL_QUANTIZATION:-auto}
+      DEFAULT_BACKEND_IPS: ${DEFAULT_BACKEND_IPS:-}
+      DEFAULT_BACKEND_PORT: ${DEFAULT_BACKEND_PORT:-8080}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:8000:8000"
+    command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers"]
+
+  worker:
+    build: ./backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-llamagrid}:${POSTGRES_PASSWORD:-change-me}@postgres:5432/${POSTGRES_DB:-llamagrid}
+      REDIS_URL: redis://redis:6379/0
+      DISPATCHER_URL: ${DISPATCHER_URL:?set DISPATCHER_URL in .env}
+      DISPATCHER_API_KEY: ${LLAMAGRID_API_KEY:-}
+      PUBLIC_MODEL_ID: ${PUBLIC_MODEL_ID:-default-model}
+      PUBLIC_MODEL_DISPLAY_NAME: ${PUBLIC_MODEL_DISPLAY_NAME:-Configured model}
+      PUBLIC_MODEL_CONTEXT_LENGTH: ${PUBLIC_MODEL_CONTEXT_LENGTH:-0}
+      PUBLIC_MODEL_QUANTIZATION: ${PUBLIC_MODEL_QUANTIZATION:-auto}
+      DEFAULT_BACKEND_IPS: ${DEFAULT_BACKEND_IPS:-}
+      DEFAULT_BACKEND_PORT: ${DEFAULT_BACKEND_PORT:-8080}
+    depends_on:
+      backend:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    command: ["celery", "-A", "app.worker.celery_app:celery_app", "worker", "--loglevel=INFO", "--concurrency=2"]
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_CONTROL_PLANE_URL: ${NEXT_PUBLIC_CONTROL_PLANE_URL:-}
+    depends_on:
+      backend:
+        condition: service_started
+    ports:
+      - "127.0.0.1:3000:3000"
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  default:
+    name: llamagrid-control-plane
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${CONTROL_PLANE_SUBNET:?set CONTROL_PLANE_SUBNET in .env}
+          gateway: ${CONTROL_PLANE_GATEWAY:?set CONTROL_PLANE_GATEWAY in .env}
