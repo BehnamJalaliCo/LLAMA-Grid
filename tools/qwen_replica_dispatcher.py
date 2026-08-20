@@ -26,6 +26,17 @@ REQUEST_ID_RE = re.compile(r"[^A-Za-z0-9_.:-]")
 MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+/-]{0,199}$")
 
 
+class ClientDisconnected(Exception):
+    """The downstream caller went away after a backend response was established."""
+
+
+def record_backend_outcome(state, backend, status, input_tokens, output_tokens):
+    """Record an upstream response without confusing caller disconnects with backend failure."""
+    if status >= 500:
+        state.mark_unhealthy(backend)
+    state.record_request(status, input_tokens, output_tokens)
+
+
 class DispatcherState:
     def __init__(
         self,
@@ -369,49 +380,70 @@ class DispatcherHandler(BaseHTTPRequestHandler):
             is_stream = is_stream or stream_requested
 
             if is_stream:
-                self.send_response(response.status)
-                self.send_header("Content-Type", response.getheader("Content-Type", "text/event-stream"))
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "close")
-                self.send_header("Transfer-Encoding", "chunked")
-                self.send_header("X-Backend", backend)
-                self.send_header("X-Request-ID", request_id)
-                self.send_header("X-Accel-Buffering", "no")
-                self.end_headers()
+                try:
+                    self.send_response(response.status)
+                    self.send_header("Content-Type", response.getheader("Content-Type", "text/event-stream"))
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "close")
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.send_header("X-Backend", backend)
+                    self.send_header("X-Request-ID", request_id)
+                    self.send_header("X-Accel-Buffering", "no")
+                    self.end_headers()
+                except (BrokenPipeError, ConnectionResetError) as exc:
+                    raise ClientDisconnected from exc
                 stream_buffer = bytearray()
                 while True:
+                    # Backend reads stay outside the downstream exception guard:
+                    # a reset here really is an upstream failure and must still
+                    # quarantine the replica.
                     chunk = response.read1(8192) if hasattr(response, "read1") else response.read(8192)
                     if not chunk:
                         break
                     input_tokens, output_tokens = update_stream_tokens(stream_buffer, chunk, input_tokens, output_tokens)
-                    self.wfile.write(f"{len(chunk):X}\r\n".encode("ascii"))
-                    self.wfile.write(chunk)
-                    self.wfile.write(b"\r\n")
+                    try:
+                        self.wfile.write(f"{len(chunk):X}\r\n".encode("ascii"))
+                        self.wfile.write(chunk)
+                        self.wfile.write(b"\r\n")
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError) as exc:
+                        raise ClientDisconnected from exc
+                try:
+                    self.wfile.write(b"0\r\n\r\n")
                     self.wfile.flush()
-                self.wfile.write(b"0\r\n\r\n")
-                self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError) as exc:
+                    raise ClientDisconnected from exc
             else:
                 payload = response.read()
-                self.send_response(response.status)
-                content_type = response.getheader("Content-Type")
-                if content_type:
-                    self.send_header("Content-Type", content_type)
-                self.send_header("Content-Length", str(len(payload)))
-                self.send_header("Connection", "close")
-                self.send_header("X-Backend", backend)
-                self.send_header("X-Request-ID", request_id)
-                self.end_headers()
-                self.wfile.write(payload)
+                try:
+                    self.send_response(response.status)
+                    content_type = response.getheader("Content-Type")
+                    if content_type:
+                        self.send_header("Content-Type", content_type)
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.send_header("Connection", "close")
+                    self.send_header("X-Backend", backend)
+                    self.send_header("X-Request-ID", request_id)
+                    self.end_headers()
+                    self.wfile.write(payload)
+                except (BrokenPipeError, ConnectionResetError) as exc:
+                    raise ClientDisconnected from exc
                 try:
                     value = json.loads(payload.decode("utf-8"))
                     input_tokens, output_tokens = extract_tokens(value)
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     pass
             elapsed = time.monotonic() - started
-            if response.status >= 500:
-                self.state.mark_unhealthy(backend)
-            self.state.record_request(response.status, input_tokens, output_tokens)
+            record_backend_outcome(self.state, backend, response.status, input_tokens, output_tokens)
             log_request(request_id, self.path, backend, response.status, elapsed, input_tokens, output_tokens)
+        except ClientDisconnected:
+            # The model replica answered; only the CLI/browser stopped reading.
+            # Closing the upstream connection in `finally` also cancels the
+            # remaining stream instead of wasting the replica slot. Never turn
+            # a caller cancellation into a false backend health failure.
+            elapsed = time.monotonic() - started
+            record_backend_outcome(self.state, backend, status, input_tokens, output_tokens)
+            log_request(request_id, self.path, backend, status, elapsed, input_tokens, output_tokens, error="ClientDisconnected")
         except Exception as exc:  # noqa: BLE001
             elapsed = time.monotonic() - started
             self.state.mark_unhealthy(backend)

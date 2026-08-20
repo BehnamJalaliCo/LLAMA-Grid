@@ -30,6 +30,18 @@ class DispatcherHealthTests(unittest.TestCase):
         state.refresh_health()
         self.assertFalse(state.healthy["127.0.0.1:1"])
 
+    def test_successful_backend_outcome_stays_healthy_when_downstream_disconnects(self):
+        state = self.state()
+        module.record_backend_outcome(state, "127.0.0.1:1", 200, 10, 5)
+        self.assertTrue(state.healthy["127.0.0.1:1"])
+        self.assertEqual(state.metrics["errors"], 0)
+
+    def test_failed_backend_outcome_still_marks_unhealthy(self):
+        state = self.state()
+        module.record_backend_outcome(state, "127.0.0.1:1", 503, None, None)
+        self.assertFalse(state.healthy["127.0.0.1:1"])
+        self.assertEqual(state.metrics["errors"], 1)
+
     def test_explicit_http_health_failure_marks_busy_backend_unhealthy(self):
         state = self.state()
         state.inflight["127.0.0.1:1"] = 1
