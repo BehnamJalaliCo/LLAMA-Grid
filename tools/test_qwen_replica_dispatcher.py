@@ -24,11 +24,33 @@ class DispatcherHealthTests(unittest.TestCase):
         self.assertTrue(state.healthy["127.0.0.1:1"])
         self.assertTrue(statuses[0]["preserved_busy"])
 
-    def test_idle_transport_probe_failure_marks_backend_unhealthy(self):
+    def test_busy_at_probe_is_preserved_even_if_request_finishes_before_apply(self):
+        state = self.state()
+        state.inflight["127.0.0.1:1"] = 1
+        def probe(backend):
+            state.inflight[backend] = 0
+            return {"backend": backend, "ok": False, "error": "timed out"}
+        state.backend_health = probe
+        statuses = state.refresh_health()
+        self.assertTrue(state.healthy["127.0.0.1:1"])
+        self.assertTrue(statuses[0]["preserved_busy"])
+
+    def test_one_idle_transport_miss_is_tolerated_but_two_withdraw_capacity(self):
+        state = self.state()
+        state.backend_health = lambda backend: {"backend": backend, "ok": False, "error": "timed out"}
+        first = state.refresh_health()
+        self.assertTrue(state.healthy["127.0.0.1:1"])
+        self.assertTrue(first[0]["preserved_transient"])
+        state.refresh_health()
+        self.assertFalse(state.healthy["127.0.0.1:1"])
+
+    def test_successful_probe_resets_transport_miss_streak(self):
         state = self.state()
         state.backend_health = lambda backend: {"backend": backend, "ok": False, "error": "timed out"}
         state.refresh_health()
-        self.assertFalse(state.healthy["127.0.0.1:1"])
+        state.backend_health = lambda backend: {"backend": backend, "ok": True, "status": 200}
+        state.refresh_health()
+        self.assertEqual(state.health_transport_failures["127.0.0.1:1"], 0)
 
     def test_successful_backend_outcome_stays_healthy_when_downstream_disconnects(self):
         state = self.state()

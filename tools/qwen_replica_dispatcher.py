@@ -24,6 +24,7 @@ OPENAI_PROXY_PATHS = {"/v1/completions", "/v1/chat/completions", "/v1/responses"
 PUBLIC_PATHS = {"/health", "/ready"}
 REQUEST_ID_RE = re.compile(r"[^A-Za-z0-9_.:-]")
 MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+/-]{0,199}$")
+HEALTH_TRANSPORT_FAILURE_THRESHOLD = 2
 
 
 class ClientDisconnected(Exception):
@@ -54,6 +55,7 @@ class DispatcherState:
         self.condition = threading.Condition()
         self.inflight = {backend: 0 for backend in backends}
         self.healthy = {backend: False for backend in backends}
+        self.health_transport_failures = {backend: 0 for backend in backends}
         self.next_backend = 0
         self.stop_event = threading.Event()
         self.health_thread: threading.Thread | None = None
@@ -80,23 +82,46 @@ class DispatcherState:
             self.refresh_health()
 
     def refresh_health(self) -> list[dict[str, object]]:
-        statuses = [self.backend_health(backend) for backend in self.backends]
+        statuses = []
+        for backend in self.backends:
+            # Snapshot immediately before this backend's probe. Probing all 14
+            # replicas is not atomic: a request can finish before the results
+            # are applied, so consulting only the later `inflight` value turns
+            # an expected busy timeout into a false health failure.
+            with self.condition:
+                busy_before_probe = self.inflight.get(backend, 0) > 0
+            status = self.backend_health(backend)
+            status["busy_before_probe"] = busy_before_probe
+            statuses.append(status)
         with self.condition:
             for status in statuses:
                 backend = str(status["backend"])
                 if bool(status["ok"]):
                     self.healthy[backend] = True
+                    self.health_transport_failures[backend] = 0
                     continue
-                # llama-server may not service /health quickly while a long
-                # decode is occupying its only slot. An in-flight request is
-                # stronger liveness evidence than a timed-out side probe, so
-                # preserve the last healthy state for transport/probe errors
-                # while that request is still active. Explicit HTTP health
-                # failures and real proxy failures still mark the backend down.
-                busy_probe_timeout = bool(status.get("error")) and self.inflight.get(backend, 0) > 0
-                if busy_probe_timeout and self.healthy.get(backend, False):
-                    status["preserved_busy"] = True
+                # An explicit HTTP health failure is authoritative. Transport
+                # misses are softer: llama-server can delay /health while its
+                # sole slot is decoding, and one race-window miss can land just
+                # after that decode completes. Busy misses preserve health; an
+                # idle backend must miss twice consecutively before capacity is
+                # withdrawn. A real proxy failure still calls mark_unhealthy()
+                # immediately, so this grace cannot hide a failed inference.
+                if status.get("status") is not None:
+                    self.healthy[backend] = False
+                    self.health_transport_failures[backend] = HEALTH_TRANSPORT_FAILURE_THRESHOLD
                     continue
+                if bool(status.get("error")):
+                    busy = bool(status.get("busy_before_probe")) or self.inflight.get(backend, 0) > 0
+                    if busy and self.healthy.get(backend, False):
+                        status["preserved_busy"] = True
+                        self.health_transport_failures[backend] = 0
+                        continue
+                    misses = self.health_transport_failures.get(backend, 0) + 1
+                    self.health_transport_failures[backend] = misses
+                    if self.healthy.get(backend, False) and misses < HEALTH_TRANSPORT_FAILURE_THRESHOLD:
+                        status["preserved_transient"] = True
+                        continue
                 self.healthy[backend] = False
             self.condition.notify_all()
         return statuses
@@ -150,6 +175,7 @@ class DispatcherState:
     def mark_unhealthy(self, backend: str) -> None:
         with self.condition:
             self.healthy[backend] = False
+            self.health_transport_failures[backend] = HEALTH_TRANSPORT_FAILURE_THRESHOLD
             self.condition.notify_all()
 
     def snapshot(self) -> dict[str, int]:
