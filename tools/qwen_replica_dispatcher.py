@@ -72,7 +72,21 @@ class DispatcherState:
         statuses = [self.backend_health(backend) for backend in self.backends]
         with self.condition:
             for status in statuses:
-                self.healthy[status["backend"]] = bool(status["ok"])
+                backend = str(status["backend"])
+                if bool(status["ok"]):
+                    self.healthy[backend] = True
+                    continue
+                # llama-server may not service /health quickly while a long
+                # decode is occupying its only slot. An in-flight request is
+                # stronger liveness evidence than a timed-out side probe, so
+                # preserve the last healthy state for transport/probe errors
+                # while that request is still active. Explicit HTTP health
+                # failures and real proxy failures still mark the backend down.
+                busy_probe_timeout = bool(status.get("error")) and self.inflight.get(backend, 0) > 0
+                if busy_probe_timeout and self.healthy.get(backend, False):
+                    status["preserved_busy"] = True
+                    continue
+                self.healthy[backend] = False
             self.condition.notify_all()
         return statuses
 
